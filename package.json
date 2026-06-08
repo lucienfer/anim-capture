@@ -1,0 +1,16 @@
+{
+  "name": "anim-capture",
+  "version": "0.1.0",
+  "description": "Capture web animations/transitions as timestamped frames + computed CSS, so a visual effect can be analyzed from both pixels and spec.",
+  "type": "module",
+  "bin": {
+    "capture-effect": "bin/capture.mjs"
+  },
+  "scripts": {
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  },
+  "license": "MIT"
+}
