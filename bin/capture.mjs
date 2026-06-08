@@ -1,22 +1,23 @@
 #!/usr/bin/env node
 /**
- * capture-effect — capture a web animation/transition as timestamped frames
- * plus the computed CSS that drives it.
+ * anim-capture — turn a moving visual into timestamped frames you can analyze.
  *
- * Two routes:
- *   - Route B (default): drive Chromium with Playwright, capture frames via the
- *     Chrome DevTools Protocol screencast. Frames are timestamped to the ms.
- *   - Route A (fallback): extract frames from an existing video with ffmpeg
- *     (--from-video <path>).
+ * Two sources:
+ *   - Web (default): drive Chromium with Playwright and capture an animation or
+ *     transition via the Chrome DevTools Protocol screencast, alongside the
+ *     computed CSS that drives it. Frames are timestamped to the ms.
+ *   - Video (--from-video <path>): analyze any video file with ffmpeg. Sample it
+ *     by frame rate, by a fixed number of evenly-spaced frames, or by scene cuts;
+ *     restrict to a time range; every frame is timestamped and described in meta.
  *
  * Output (per run):
- *   <out>/frames/frame_tNNNN.NNNs.png   one image per painted frame
- *   <out>/computed.json                 computed CSS of the target selector
- *   <out>/meta.json                     url, interaction, fps, real duration
+ *   <out>/frames/frame_NNNN_tX.XXXs.png   timestamped frames
+ *   <out>/computed.json                   computed CSS of the target (web source)
+ *   <out>/meta.json                       source, sampling, timing, per-frame index
  */
 
 import { chromium } from 'playwright';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, rm, readdir, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -33,8 +34,13 @@ function parseArgs(argv) {
     height: 800,
     out: null,
     maxFrames: 240,
-    fromVideo: null,          // Route A: extract from this video instead
-    fps: 30,                  // only used by the ffmpeg route
+    // video source
+    fromVideo: null,          // path to a video file to analyze
+    fps: null,                // sample N frames per second (default 2 if no mode set)
+    frames: null,             // OR sample N evenly-spaced frames across the range
+    scene: null,              // OR sample on scene cuts above this threshold (0-1)
+    start: null,              // start time in seconds
+    end: null,                // end time in seconds
   };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -51,6 +57,10 @@ function parseArgs(argv) {
       case '--max-frames': args.maxFrames = Number(next()); break;
       case '--from-video': args.fromVideo = next(); break;
       case '--fps': args.fps = Number(next()); break;
+      case '--frames': args.frames = Number(next()); break;
+      case '--scene': args.scene = Number(next()); break;
+      case '--start': args.start = Number(next()); break;
+      case '--end': args.end = Number(next()); break;
       case '-h': case '--help': args.help = true; break;
       default: console.error(`Unknown arg: ${a}`); process.exit(2);
     }
@@ -58,50 +68,157 @@ function parseArgs(argv) {
   return args;
 }
 
-const HELP = `capture-effect — capture a web animation as timestamped frames + computed CSS
+const HELP = `anim-capture — turn a moving visual into timestamped frames you can analyze
 
-Usage:
-  capture-effect --url <url> [--interaction load|hover|click|scroll]
-                 [--selector <css>] [--duration <ms>] [--out <dir>]
+Web source (default):
+  anim-capture --url <url> [--interaction load|hover|click|scroll]
+               [--selector <css>] [--duration <ms>] [--out <dir>]
 
-  capture-effect --from-video <path> [--fps 30] [--out <dir>]   (ffmpeg route)
+Video source:
+  anim-capture --from-video <path> [--fps <n> | --frames <n> | --scene <0-1>]
+               [--start <sec>] [--end <sec>] [--out <dir>]
 
-Options:
+Web options:
   --url <url>            Page to open.
   --interaction <type>   What triggers the effect: load (default), hover, click, scroll.
   --selector <css>       Element to hover/click and to inspect for computed CSS.
   --duration <ms>        How long to record after the trigger (default 1000).
   --settle <ms>          Wait after navigation before triggering (default 300).
   --width/--height       Viewport size (default 1280x800).
+
+Video options (pick one sampling mode; defaults to --fps 2):
+  --from-video <path>    Analyze this video file with ffmpeg.
+  --fps <n>              Sample n frames per second.
+  --frames <n>           Sample n frames evenly spread across the range.
+  --scene <0-1>          Sample only on scene cuts above this threshold (e.g. 0.3).
+  --start <sec>          Start time (default 0).
+  --end <sec>            End time (default end of video).
+
+Common:
   --max-frames <n>       Safety cap on captured frames (default 240).
   --out <dir>            Output dir (default ./captures/capture_<n>).
-  --from-video <path>    Skip the browser; extract frames from a video with ffmpeg.
-  --fps <n>              Frame rate for the ffmpeg route (default 30).
 `;
 
 function tstamp(seconds) {
   return `t${seconds.toFixed(3)}s`;
 }
 
-// ---------- Route A: ffmpeg ----------
+function which(bin) {
+  return spawnSync(bin, ['-version'], { stdio: 'ignore' }).status === 0;
+}
+
+// probe a video for duration / resolution / frame rate
+function probeVideo(file) {
+  const r = spawnSync('ffprobe', [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height,r_frame_rate:format=duration',
+    '-of', 'json', file,
+  ], { encoding: 'utf8' });
+  if (r.status !== 0) return null;
+  try {
+    const j = JSON.parse(r.stdout);
+    const s = (j.streams && j.streams[0]) || {};
+    const [num, den] = (s.r_frame_rate || '0/1').split('/').map(Number);
+    return {
+      width: s.width ?? null,
+      height: s.height ?? null,
+      fps: den ? Number((num / den).toFixed(3)) : null,
+      duration: j.format && j.format.duration ? Number(j.format.duration) : null,
+    };
+  } catch { return null; }
+}
+
+// ---------- Video source: ffmpeg ----------
 async function fromVideo(args) {
-  const out = args.out || path.resolve('captures', 'capture_video');
-  const framesDir = path.join(out, 'frames');
-  await mkdir(framesDir, { recursive: true });
-  const r = spawnSync('ffmpeg', [
-    '-i', args.fromVideo,
-    '-vf', `fps=${args.fps}`,
-    '-y',
-    path.join(framesDir, 'frame_%04d.png'),
-  ], { stdio: 'inherit' });
-  if (r.status !== 0) {
-    console.error('ffmpeg failed. Is ffmpeg installed?');
+  if (!which('ffmpeg') || !which('ffprobe')) {
+    console.error('ffmpeg/ffprobe not found. Install ffmpeg to analyze videos.');
     process.exit(1);
   }
+  if (!existsSync(args.fromVideo)) {
+    console.error(`Video not found: ${args.fromVideo}`); process.exit(1);
+  }
+
+  let out = args.out;
+  if (!out) {
+    let n = 1;
+    while (existsSync(path.resolve('captures', `capture_${n}`))) n++;
+    out = path.resolve('captures', `capture_${n}`);
+  }
+  const framesDir = path.join(out, 'frames');
+  await rm(out, { recursive: true, force: true });
+  await mkdir(framesDir, { recursive: true });
+
+  const info = probeVideo(args.fromVideo) || {};
+  const start = args.start ?? 0;
+  const end = args.end ?? info.duration ?? null;
+
+  // pick a sampling mode: scene > frames > fps (default fps=2)
+  const mode = args.scene != null ? 'scene' : args.frames != null ? 'frames' : 'fps';
+  const trim = (extra) => [
+    ...(start ? ['-ss', String(start)] : []),
+    '-i', args.fromVideo,
+    ...(end != null ? ['-t', String(end - start)] : []),
+    ...extra,
+  ];
+
+  let written = [];
+
+  if (mode === 'frames') {
+    // N frames evenly spread across [start, end], sampled at interval midpoints
+    // so none lands exactly on the end (which would yield no frame).
+    const span = (end ?? info.duration ?? 0) - start;
+    const n = Math.max(1, args.frames);
+    for (let i = 0; i < n && i < args.maxFrames; i++) {
+      const t = start + (span * (i + 0.5)) / n;
+      const file = `frame_${String(i).padStart(4, '0')}_${tstamp(t)}.png`;
+      const dest = path.join(framesDir, file);
+      const r = spawnSync('ffmpeg', [
+        '-ss', String(t), '-i', args.fromVideo,
+        '-frames:v', '1', '-y', dest,
+      ], { stdio: 'ignore' });
+      if (r.status === 0 && existsSync(dest)) written.push({ index: i, t: Number(t.toFixed(3)), file });
+    }
+  } else {
+    // fps or scene: let ffmpeg select frames, capture showinfo to recover timestamps
+    const vf = mode === 'scene'
+      ? `select='gt(scene,${args.scene})',showinfo`
+      : `fps=${args.fps ?? 2},showinfo`;
+    const r = spawnSync('ffmpeg', trim([
+      '-vf', vf, '-vsync', 'vfr', '-frame_pts', '1',
+      '-y', path.join(framesDir, 'frame_%05d.png'),
+    ]), { encoding: 'utf8' });
+    if (r.status !== 0) { console.error('ffmpeg failed:\n' + (r.stderr || '')); process.exit(1); }
+
+    // showinfo prints "pts_time:N" per emitted frame, in order
+    const times = [...(r.stderr || '').matchAll(/pts_time:([0-9.]+)/g)].map(m => start + Number(m[1]));
+    const produced = (await readdir(framesDir)).filter(f => f.endsWith('.png')).sort();
+    for (let i = 0; i < produced.length && i < args.maxFrames; i++) {
+      const t = times[i] ?? start;
+      const file = `frame_${String(i).padStart(4, '0')}_${tstamp(t)}.png`;
+      await rename(path.join(framesDir, produced[i]), path.join(framesDir, file));
+      written.push({ index: i, t: Number(t.toFixed(3)), file });
+    }
+    // drop any frames beyond the cap
+    for (let i = args.maxFrames; i < produced.length; i++) {
+      await rm(path.join(framesDir, produced[i]), { force: true });
+    }
+  }
+
   await writeFile(path.join(out, 'meta.json'), JSON.stringify({
-    route: 'ffmpeg', source: args.fromVideo, fps: args.fps,
+    source: 'video',
+    file: args.fromVideo,
+    video: info,
+    sampling: mode === 'scene' ? { mode, threshold: args.scene }
+            : mode === 'frames' ? { mode, frames: args.frames }
+            : { mode, fps: args.fps ?? 2 },
+    range: { start, end },
+    framesWritten: written.length,
+    frames: written,
   }, null, 2));
-  console.log(`\nDone. Frames extracted to ${framesDir}`);
+
+  console.log(`\nDone.`);
+  console.log(`  frames: ${framesDir} (${written.length} frames, mode=${mode})`);
+  console.log(`  meta:   ${path.join(out, 'meta.json')}`);
 }
 
 // ---------- Route B: CDP screencast ----------

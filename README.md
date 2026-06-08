@@ -1,25 +1,31 @@
 # anim-capture
 
-Capture web animations / transitions as **timestamped frames + the computed CSS
-that drives them**, so an agent (or you) can analyze a visual effect instead of
-only reading its code.
+Turn a moving visual into **timestamped frames you can analyze** — from a live web
+page or from any video file. So an agent (or you) can reason about a visual effect
+from the rendered pixels, not just from code or a single screenshot.
 
-> Why both? The code is the *specification* (exact duration, easing, properties).
-> The frames are the *rendered reality* (spring feel, WebGL, layered effects, and
-> any mismatch between spec and what actually paints). Good analysis uses both.
+Two sources:
+
+- **Web** — drive Chromium and capture an animation/transition as it paints, plus
+  the **computed CSS** that drives it.
+- **Video** — sample any video file into frames (by frame rate, by a fixed count,
+  or on scene cuts), each one timestamped.
+
+> Why frames? A still screenshot misses the motion; reading code misses the
+> rendered reality (spring feel, WebGL, compositing, spec-vs-actual mismatch).
+> Sampled, timestamped frames let you analyze how a visual evolves over time.
 
 ## Install
 
 ```bash
-npm install        # installs Playwright + downloads Chromium
+npm install        # installs Playwright + downloads Chromium (for the web source)
 ```
 
-`ffmpeg` is only required for the `--from-video` route (extracting frames from an
-existing video).
+`ffmpeg` (with `ffprobe`) is required for the video source.
 
 ## Usage
 
-Capture an interaction:
+### Web source — capture an animation/transition
 
 ```bash
 node bin/capture.mjs \
@@ -32,11 +38,24 @@ node bin/capture.mjs \
 `--interaction`: `load` (default) · `hover` · `click` · `scroll`
 (`hover`/`click` need `--selector`).
 
-Extract frames from a video you already have:
+### Video source — analyze a video file
 
 ```bash
-node bin/capture.mjs --from-video ./demo.mov --fps 30
+# sample 2 frames per second (default)
+node bin/capture.mjs --from-video ./clip.mp4
+
+# sample 12 frames evenly across the clip
+node bin/capture.mjs --from-video ./clip.mp4 --frames 12
+
+# sample only on scene cuts (good for "show me the key moments")
+node bin/capture.mjs --from-video ./clip.mp4 --scene 0.3
+
+# restrict to a time window
+node bin/capture.mjs --from-video ./clip.mp4 --start 4 --end 7 --fps 5
 ```
+
+Sampling modes are mutually exclusive; precedence is `--scene` > `--frames` >
+`--fps` (default `--fps 2`).
 
 Run `node bin/capture.mjs --help` for all options.
 
@@ -46,23 +65,24 @@ Each run writes `./captures/capture_<n>/`:
 
 | File | What |
 |---|---|
-| `frames/frame_NNNN_tX.XXXs.png` | one image per painted frame, timestamped |
-| `computed.json` | computed CSS of `--selector` (transition, easing, animation…) |
-| `meta.json` | url, interaction, real duration, per-frame timing |
+| `frames/frame_NNNN_tX.XXXs.png` | sampled frames, each named with its timestamp |
+| `computed.json` | *(web source)* computed CSS of `--selector` (transition, easing…) |
+| `meta.json` | source, sampling mode, time range, video info, per-frame timing |
 
-## Two capture routes
+## How it works
 
-- **CDP screencast (default).** Drives Chromium via the Chrome DevTools Protocol
-  and grabs frames as they paint, timestamped to the millisecond. No video
-  re-encoding, so no compression loss.
-- **ffmpeg (`--from-video`).** Falls back to extracting frames from an existing
-  video file.
+- **Web (CDP screencast).** Drives Chromium via the Chrome DevTools Protocol and
+  grabs frames as they paint, timestamped to the millisecond — no video re-encoding,
+  so no compression loss.
+- **Video (ffmpeg + ffprobe).** Probes the file for duration/resolution/frame rate,
+  then samples it by frame rate, by an even frame count, or on scene cuts, recovering
+  each frame's real timestamp.
 
 ## Use from an agent harness
 
 The `skill/capture-effect/` folder ships a `SKILL.md` manifest so an agent harness
-that supports the skill format can invoke the CLI autonomously when a task involves
-analyzing a web animation. Point your harness's skills directory at it, e.g.:
+that supports the skill format can invoke the CLI autonomously. Point your harness's
+skills directory at it, e.g.:
 
 ```bash
 ln -s "$(pwd)/skill/capture-effect" <your-skills-dir>/capture-effect
@@ -70,8 +90,10 @@ ln -s "$(pwd)/skill/capture-effect" <your-skills-dir>/capture-effect
 
 ## Notes & limits
 
-- Screencast frame rate is capped by the browser paint rate (~60fps max).
-- Keep `--duration` close to the real animation length; extra time just adds
-  redundant frames.
-- For "why is it janky" (dropped frames, layout thrash), use a performance trace,
+- Web screencast frame rate is capped by the browser paint rate (~60fps max).
+- Video frame extraction can only surface frames that exist in the file — you can't
+  sample finer than the recording's own frame rate.
+- More frames isn't better: for a long video prefer `--frames N` or `--scene` over a
+  high `--fps`, to avoid a flood of near-identical images.
+- For web "why is it janky" (dropped frames, layout thrash), use a performance trace,
   not frames.
