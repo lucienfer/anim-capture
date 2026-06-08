@@ -38,6 +38,18 @@ node bin/capture.mjs \
 `--interaction`: `load` (default) · `hover` · `click` · `scroll`
 (`hover`/`click` need `--selector`).
 
+By default the web source uses a CDP screencast, which only emits frames the
+browser hands over — so a fast or GPU-composited transition can lose its in-between
+states. Add `--record` to instead capture a **real video** of the interaction and
+sample that (continuous capture, nothing skipped). The CSS is still dumped, and the
+video sampling options (`--fps`/`--frames`/`--scene`) apply:
+
+```bash
+node bin/capture.mjs \
+  --url "https://example.com" --interaction hover --selector ".card" \
+  --duration 800 --record --frames 10
+```
+
 ### Video source — analyze a video file
 
 ```bash
@@ -90,6 +102,9 @@ ln -s "$(pwd)/skill/capture-effect" <your-skills-dir>/capture-effect
 
 ## Notes & limits
 
+- The default web screencast can miss frames of fast/composited transitions (it
+  only emits frames the browser acknowledges). Use `--record` for a continuous
+  capture when timing accuracy matters; the CSS readout is reliable either way.
 - Web screencast frame rate is capped by the browser paint rate (~60fps max).
 - Video frame extraction can only surface frames that exist in the file — you can't
   sample finer than the recording's own frame rate.

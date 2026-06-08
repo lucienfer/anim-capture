@@ -37,6 +37,17 @@ node <repo>/bin/capture.mjs \
 `--interaction` is one of: `load` (default), `hover`, `click`, `scroll`.
 `hover` and `click` require `--selector`.
 
+The default capture is a CDP screencast, which can miss frames of a fast or
+GPU-composited transition. Add `--record` to capture a real video of the
+interaction and sample it instead (continuous, nothing skipped); the computed CSS
+is still dumped, and `--fps`/`--frames`/`--scene` apply to the sampling:
+```bash
+node <repo>/bin/capture.mjs --url "https://example.com" \
+  --interaction hover --selector ".card" --duration 800 --record --frames 10
+```
+Prefer `--record` when timing/intermediate states matter; the plain screencast is
+fine for a quick look or when you mostly care about the CSS.
+
 ### Video file
 ```bash
 node <repo>/bin/capture.mjs --from-video ./clip.mp4 --frames 12   # 12 even frames

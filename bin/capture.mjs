@@ -34,6 +34,7 @@ function parseArgs(argv) {
     height: 800,
     out: null,
     maxFrames: 240,
+    record: false,            // web: record a real video then sample it
     // video source
     fromVideo: null,          // path to a video file to analyze
     fps: null,                // sample N frames per second (default 2 if no mode set)
@@ -55,6 +56,7 @@ function parseArgs(argv) {
       case '--height': args.height = Number(next()); break;
       case '--out': args.out = next(); break;
       case '--max-frames': args.maxFrames = Number(next()); break;
+      case '--record': args.record = true; break;
       case '--from-video': args.fromVideo = next(); break;
       case '--fps': args.fps = Number(next()); break;
       case '--frames': args.frames = Number(next()); break;
@@ -72,7 +74,7 @@ const HELP = `anim-capture — turn a moving visual into timestamped frames you 
 
 Web source (default):
   anim-capture --url <url> [--interaction load|hover|click|scroll]
-               [--selector <css>] [--duration <ms>] [--out <dir>]
+               [--selector <css>] [--duration <ms>] [--record] [--out <dir>]
 
 Video source:
   anim-capture --from-video <path> [--fps <n> | --frames <n> | --scene <0-1>]
@@ -84,6 +86,10 @@ Web options:
   --selector <css>       Element to hover/click and to inspect for computed CSS.
   --duration <ms>        How long to record after the trigger (default 1000).
   --settle <ms>          Wait after navigation before triggering (default 300).
+  --record               Record a real video of the interaction and sample it,
+                         instead of the CDP screencast. Catches fast/composited
+                         frames the screencast can miss. Sampling options below
+                         apply (default --fps 30); needs ffmpeg.
   --width/--height       Viewport size (default 1280x800).
 
 Video options (pick one sampling mode; defaults to --fps 2):
@@ -129,39 +135,25 @@ function probeVideo(file) {
 }
 
 // ---------- Video source: ffmpeg ----------
-async function fromVideo(args) {
-  if (!which('ffmpeg') || !which('ffprobe')) {
-    console.error('ffmpeg/ffprobe not found. Install ffmpeg to analyze videos.');
-    process.exit(1);
-  }
-  if (!existsSync(args.fromVideo)) {
-    console.error(`Video not found: ${args.fromVideo}`); process.exit(1);
-  }
-
-  let out = args.out;
-  if (!out) {
-    let n = 1;
-    while (existsSync(path.resolve('captures', `capture_${n}`))) n++;
-    out = path.resolve('captures', `capture_${n}`);
-  }
-  const framesDir = path.join(out, 'frames');
-  await rm(out, { recursive: true, force: true });
-  await mkdir(framesDir, { recursive: true });
-
-  const info = probeVideo(args.fromVideo) || {};
+// Sample a video file into timestamped frames inside framesDir.
+// Reused by --from-video and by the web --record mode.
+// Returns { written, info, mode, sampling, range }.
+async function sampleVideoFile(videoFile, framesDir, args, defaultFps = 2) {
+  const info = probeVideo(videoFile) || {};
   const start = args.start ?? 0;
   const end = args.end ?? info.duration ?? null;
 
-  // pick a sampling mode: scene > frames > fps (default fps=2)
+  // pick a sampling mode: scene > frames > fps
   const mode = args.scene != null ? 'scene' : args.frames != null ? 'frames' : 'fps';
+  const fps = args.fps ?? defaultFps;
   const trim = (extra) => [
     ...(start ? ['-ss', String(start)] : []),
-    '-i', args.fromVideo,
+    '-i', videoFile,
     ...(end != null ? ['-t', String(end - start)] : []),
     ...extra,
   ];
 
-  let written = [];
+  const written = [];
 
   if (mode === 'frames') {
     // N frames evenly spread across [start, end], sampled at interval midpoints
@@ -173,7 +165,7 @@ async function fromVideo(args) {
       const file = `frame_${String(i).padStart(4, '0')}_${tstamp(t)}.png`;
       const dest = path.join(framesDir, file);
       const r = spawnSync('ffmpeg', [
-        '-ss', String(t), '-i', args.fromVideo,
+        '-ss', String(t), '-i', videoFile,
         '-frames:v', '1', '-y', dest,
       ], { stdio: 'ignore' });
       if (r.status === 0 && existsSync(dest)) written.push({ index: i, t: Number(t.toFixed(3)), file });
@@ -182,7 +174,7 @@ async function fromVideo(args) {
     // fps or scene: let ffmpeg select frames, capture showinfo to recover timestamps
     const vf = mode === 'scene'
       ? `select='gt(scene,${args.scene})',showinfo`
-      : `fps=${args.fps ?? 2},showinfo`;
+      : `fps=${fps},showinfo`;
     const r = spawnSync('ffmpeg', trim([
       '-vf', vf, '-vsync', 'vfr', '-frame_pts', '1',
       '-y', path.join(framesDir, 'frame_%05d.png'),
@@ -204,14 +196,41 @@ async function fromVideo(args) {
     }
   }
 
+  const sampling = mode === 'scene' ? { mode, threshold: args.scene }
+                 : mode === 'frames' ? { mode, frames: args.frames }
+                 : { mode, fps };
+  return { written, info, mode, sampling, range: { start, end } };
+}
+
+function nextCaptureDir(args) {
+  if (args.out) return args.out;
+  let n = 1;
+  while (existsSync(path.resolve('captures', `capture_${n}`))) n++;
+  return path.resolve('captures', `capture_${n}`);
+}
+
+async function fromVideo(args) {
+  if (!which('ffmpeg') || !which('ffprobe')) {
+    console.error('ffmpeg/ffprobe not found. Install ffmpeg to analyze videos.');
+    process.exit(1);
+  }
+  if (!existsSync(args.fromVideo)) {
+    console.error(`Video not found: ${args.fromVideo}`); process.exit(1);
+  }
+
+  const out = nextCaptureDir(args);
+  const framesDir = path.join(out, 'frames');
+  await rm(out, { recursive: true, force: true });
+  await mkdir(framesDir, { recursive: true });
+
+  const { written, info, mode, sampling, range } = await sampleVideoFile(args.fromVideo, framesDir, args);
+
   await writeFile(path.join(out, 'meta.json'), JSON.stringify({
     source: 'video',
     file: args.fromVideo,
     video: info,
-    sampling: mode === 'scene' ? { mode, threshold: args.scene }
-            : mode === 'frames' ? { mode, frames: args.frames }
-            : { mode, fps: args.fps ?? 2 },
-    range: { start, end },
+    sampling,
+    range,
     framesWritten: written.length,
     frames: written,
   }, null, 2));
@@ -221,67 +240,28 @@ async function fromVideo(args) {
   console.log(`  meta:   ${path.join(out, 'meta.json')}`);
 }
 
-// ---------- Route B: CDP screencast ----------
-async function fromBrowser(args) {
-  if (!args.url) { console.error('--url is required (or use --from-video).'); process.exit(2); }
+// capture computed CSS of the target (the animation "spec")
+async function captureComputed(page, selector) {
+  if (!selector) return null;
+  return page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return { error: `selector not found: ${sel}` };
+    const cs = getComputedStyle(el);
+    const pick = [
+      'transition', 'transitionProperty', 'transitionDuration',
+      'transitionTimingFunction', 'transitionDelay',
+      'animation', 'animationName', 'animationDuration',
+      'animationTimingFunction', 'animationDelay', 'animationIterationCount',
+      'transform', 'opacity', 'willChange',
+    ];
+    const o = {};
+    for (const k of pick) o[k] = cs[k];
+    return o;
+  }, selector);
+}
 
-  // pick a default out dir
-  let out = args.out;
-  if (!out) {
-    let n = 1;
-    while (existsSync(path.resolve('captures', `capture_${n}`))) n++;
-    out = path.resolve('captures', `capture_${n}`);
-  }
-  const framesDir = path.join(out, 'frames');
-  await rm(out, { recursive: true, force: true });
-  await mkdir(framesDir, { recursive: true });
-
-  const browser = await chromium.launch();
-  const context = await browser.newContext({
-    viewport: { width: args.width, height: args.height },
-    deviceScaleFactor: 1,
-  });
-  const page = await context.newPage();
-
-  await page.goto(args.url, { waitUntil: 'load' });
-  await page.waitForTimeout(args.settle);
-
-  // capture computed CSS of the target before we start (the "spec")
-  let computed = null;
-  if (args.selector) {
-    computed = await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return { error: `selector not found: ${sel}` };
-      const cs = getComputedStyle(el);
-      const pick = [
-        'transition', 'transitionProperty', 'transitionDuration',
-        'transitionTimingFunction', 'transitionDelay',
-        'animation', 'animationName', 'animationDuration',
-        'animationTimingFunction', 'animationDelay', 'animationIterationCount',
-        'transform', 'opacity', 'willChange',
-      ];
-      const o = {};
-      for (const k of pick) o[k] = cs[k];
-      return o;
-    }, args.selector);
-  }
-
-  // start screencast
-  const client = await context.newCDPSession(page);
-  const frames = [];
-  client.on('Page.screencastFrame', async (frame) => {
-    frames.push({ data: frame.data, ts: frame.metadata.timestamp });
-    try { await client.send('Page.screencastFrameAck', { sessionId: frame.sessionId }); }
-    catch { /* page may be closing */ }
-  });
-  await client.send('Page.startScreencast', {
-    format: 'png',
-    everyNthFrame: 1,
-  });
-
-  const t0 = Date.now();
-
-  // trigger the effect
+// fire the interaction that triggers the effect
+async function triggerInteraction(page, args) {
   switch (args.interaction) {
     case 'hover':
       if (!args.selector) { console.error('hover needs --selector'); process.exit(2); }
@@ -298,6 +278,104 @@ async function fromBrowser(args) {
     default:
       break; // effect already triggered by navigation
   }
+}
+
+// ---------- Web source, --record: drive + record a real video, then sample ----------
+// Avoids the screencast's frame-selection gaps: the video is a continuous capture,
+// so fast/composited transitions don't lose their in-between states.
+async function recordWeb(args) {
+  if (!which('ffmpeg') || !which('ffprobe')) {
+    console.error('ffmpeg/ffprobe not found. Install ffmpeg to use --record.');
+    process.exit(1);
+  }
+  const out = nextCaptureDir(args);
+  const framesDir = path.join(out, 'frames');
+  await rm(out, { recursive: true, force: true });
+  await mkdir(framesDir, { recursive: true });
+  const videoDir = path.join(out, '.video');
+  await mkdir(videoDir, { recursive: true });
+
+  const browser = await chromium.launch();
+  const context = await browser.newContext({
+    viewport: { width: args.width, height: args.height },
+    deviceScaleFactor: 1,
+    recordVideo: { dir: videoDir, size: { width: args.width, height: args.height } },
+  });
+  const page = await context.newPage();
+  await page.goto(args.url, { waitUntil: 'load' });
+  await page.waitForTimeout(args.settle);
+
+  const computed = await captureComputed(page, args.selector);
+  const video = page.video();
+  await triggerInteraction(page, args);
+  await page.waitForTimeout(args.duration);
+
+  await context.close();              // finalizes the .webm
+  const videoPath = await video.path();
+  await browser.close();
+
+  // sample the recording; default to a dense fps so nothing is missed
+  const { written, info, mode, sampling, range } =
+    await sampleVideoFile(videoPath, framesDir, args, 30);
+  await rm(videoDir, { recursive: true, force: true });
+
+  if (computed) await writeFile(path.join(out, 'computed.json'), JSON.stringify(computed, null, 2));
+  await writeFile(path.join(out, 'meta.json'), JSON.stringify({
+    source: 'web-record',
+    url: args.url,
+    interaction: args.interaction,
+    selector: args.selector,
+    durationMs: args.duration,
+    video: info,
+    sampling,
+    range,
+    framesWritten: written.length,
+    frames: written,
+  }, null, 2));
+
+  console.log(`\nDone.`);
+  console.log(`  frames:   ${framesDir} (${written.length} frames from recording, mode=${mode})`);
+  if (computed) console.log(`  computed: ${path.join(out, 'computed.json')}`);
+  console.log(`  meta:     ${path.join(out, 'meta.json')}`);
+}
+
+// ---------- Web source, default: CDP screencast ----------
+async function fromBrowser(args) {
+  if (!args.url) { console.error('--url is required (or use --from-video).'); process.exit(2); }
+
+  const out = nextCaptureDir(args);
+  const framesDir = path.join(out, 'frames');
+  await rm(out, { recursive: true, force: true });
+  await mkdir(framesDir, { recursive: true });
+
+  const browser = await chromium.launch();
+  const context = await browser.newContext({
+    viewport: { width: args.width, height: args.height },
+    deviceScaleFactor: 1,
+  });
+  const page = await context.newPage();
+
+  await page.goto(args.url, { waitUntil: 'load' });
+  await page.waitForTimeout(args.settle);
+
+  const computed = await captureComputed(page, args.selector);
+
+  // start screencast
+  const client = await context.newCDPSession(page);
+  const frames = [];
+  client.on('Page.screencastFrame', async (frame) => {
+    frames.push({ data: frame.data, ts: frame.metadata.timestamp });
+    try { await client.send('Page.screencastFrameAck', { sessionId: frame.sessionId }); }
+    catch { /* page may be closing */ }
+  });
+  await client.send('Page.startScreencast', {
+    format: 'png',
+    everyNthFrame: 1,
+  });
+
+  const t0 = Date.now();
+
+  await triggerInteraction(page, args);
 
   await page.waitForTimeout(args.duration);
   await client.send('Page.stopScreencast').catch(() => {});
@@ -341,4 +419,5 @@ async function fromBrowser(args) {
 const args = parseArgs(process.argv);
 if (args.help) { console.log(HELP); process.exit(0); }
 if (args.fromVideo) await fromVideo(args);
+else if (args.record) await recordWeb(args);
 else await fromBrowser(args);
